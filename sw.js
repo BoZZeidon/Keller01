@@ -1,5 +1,5 @@
-// Service Worker: App komplett offline nutzbar (Daten liegen ohnehin im Gerät)
-const CACHE = "keller01-offline-v1";
+// Service Worker: nur App-Dateien cachen, Worker-API immer live
+const CACHE = "keller01-online-v1";
 const DATEIEN = ["./", "./index.html", "./manifest.json",
   "./icon-192.png", "./icon-512.png", "./icon-180.png"];
 
@@ -14,6 +14,8 @@ self.addEventListener("activate", (e) => {
 });
 self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET") return;
+  const url = new URL(e.request.url);
+  if (url.origin !== self.location.origin) return; // Worker-API nie cachen
   e.respondWith(
     fetch(e.request)
       .then((antwort) => {

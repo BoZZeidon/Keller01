@@ -289,30 +289,41 @@ label.fl{display:block;font-size:12px;color:var(--grau);text-transform:uppercase
 <div class="toast" id="toast"></div>
 
 <script>
-/* ============ DEMO-ZUSTAND (nur im Speicher) ============ */
+/* ================= VERBINDUNG ================= */
+// >>> HIER deine Worker-Adresse eintragen (aus dem Cloudflare-Dashboard): <<<
+const WORKER_URL = "https://keller01.879c9ps7wh.workers.dev";
+
 const BASIS = location.origin && location.origin !== "null"
   ? location.origin + location.pathname.replace(/index\.html$/, "")
   : "https://keller01.local/";
-let nutzer = [];
-let angemeldet = null;
 
+/* ================= ZUSTAND ================= */
+let artikelListe = [];
+let aktuellerArtikel = null;
+let scannerInstanz = null;
 let feldConfig = {
   labels: { name:"Artikelname", nummer:"Artikelnummer", kiste:"Kiste",
     menge:"Menge", soll:"Sollwert", ref:"REF-Nr", notiz:"Notiz",
     sortid:"SortID", aliase:"Andere Namen" },
   felder: [],
 };
-
-let naechsteId = 1;
-let artikel = [];
-let aktuellerArtikel = null;
-let scannerInstanz = null;
-let formFotoDataUrl = null;
+let token = "";
+let formFotoDataUrl = null;   // null = unverändert
+let formThumb = null;
 let formFotoLoeschen = false;
 let cfgFelderTmp = null;
 
-/* ---------- DAUERHAFTE SPEICHERUNG (IndexedDB) ---------- */
-let idb = null, nurSpeicher = false;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function toast(text){
+  const t = $("toast"); t.textContent = text; t.classList.add("zeigen");
+  clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove("zeigen"), 2600);
+}
+
+/* ---------- Token-Speicher (IndexedDB) ---------- */
+let idb = null;
 function oeffneDb(){
   return new Promise((resolve) => {
     try{
@@ -345,27 +356,31 @@ function kvSet(schluessel, wert){
     }catch(e){ resolve(false); }
   });
 }
-function persistiere(){
-  if(nurSpeicher) return;
-  kvSet("daten", { naechsteId, artikel, feldConfig, nutzer });
-}
-async function hashPw(pw){
-  const d = await crypto.subtle.digest("SHA-256",
-    new TextEncoder().encode("keller01:" + pw));
-  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, "0")).join("");
+
+/* ---------- API ---------- */
+async function api(pfad, optionen = {}){
+  let r;
+  try{
+    r = await fetch(WORKER_URL + pfad, {
+      ...optionen,
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: "Bearer " + token } : {}),
+        ...(optionen.headers || {}),
+      },
+    });
+  }catch(e){
+    throw new Error("Keine Verbindung – Internet prüfen");
+  }
+  if(r.status === 401){ zeigeLogin(true); throw new Error("Nicht angemeldet"); }
+  const daten = await r.json().catch(() => ({}));
+  if(!r.ok) throw new Error(daten.fehler || "Serverfehler");
+  return daten;
 }
 
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-
-function toast(text){
-  const t = $("toast"); t.textContent = text; t.classList.add("zeigen");
-  clearTimeout(t._timer); t._timer = setTimeout(() => t.classList.remove("zeigen"), 2600);
-}
-
-/* ============ LOGIN ============ */
+/* ================= LOGIN ================= */
 let loginModus = "login";
+function zeigeLogin(an){ $("login").classList.toggle("offen", an); }
 function loginTab(modus){
   loginModus = modus;
   $("tab-login").classList.toggle("aktiv", modus === "login");
@@ -374,45 +389,46 @@ function loginTab(modus){
   $("l-fehler").textContent = "";
 }
 async function loginAbsenden(){
-  const name = $("l-name").value.trim(), pass = $("l-pass").value;
   $("l-fehler").textContent = "";
-  const hash = await hashPw(pass);
-  if(loginModus === "reg"){
-    if(name.length < 3) return $("l-fehler").textContent = "Benutzername: mindestens 3 Zeichen";
-    if(pass.length < 6) return $("l-fehler").textContent = "Passwort: mindestens 6 Zeichen";
-    if(nutzer.some(u => u.benutzername === name))
-      return $("l-fehler").textContent = "Benutzername ist schon vergeben";
-    nutzer.push({ benutzername: name, hash });
-    persistiere();
-  } else {
-    const u = nutzer.find(u => u.benutzername === name && u.hash === hash);
-    if(!u) return $("l-fehler").textContent = "Benutzername oder Passwort falsch";
-  }
-  angemeldet = name;
-  kvSet("sitzung", name);
-  $("menue-nutzer").textContent = "Angemeldet als " + name;
-  $("l-pass").value = "";
-  $("login").classList.remove("offen");
-  ladeListe();
-  toast(loginModus === "reg" ? "Konto erstellt – willkommen!" : "Angemeldet");
+  try{
+    const d = await api("/auth/" + (loginModus === "login" ? "login" : "registrieren"), {
+      method: "POST",
+      body: JSON.stringify({
+        benutzername: $("l-name").value, passwort: $("l-pass").value,
+      }),
+    });
+    token = d.token;
+    kvSet("token", token);
+    $("menue-nutzer").textContent = "Angemeldet als " + d.benutzername;
+    $("l-pass").value = "";
+    zeigeLogin(false);
+    await ladeConfig();
+    await ladeListe();
+    toast(loginModus === "reg" ? "Konto erstellt – willkommen!" : "Angemeldet");
+  }catch(e){ $("l-fehler").textContent = e.message; }
 }
 $("l-pass").addEventListener("keydown", (e) => { if(e.key === "Enter") loginAbsenden(); });
-function abmelden(){
+async function abmelden(){
   zeigeMenue(false); schliesseAlles();
-  angemeldet = null;
-  kvSet("sitzung", "");
-  $("login").classList.add("offen");
+  try{ await api("/auth/logout", { method: "POST" }); }catch(e){}
+  token = ""; kvSet("token", "");
+  zeigeLogin(true);
 }
 
-/* ============ LISTE & SUCHE (sortiert nach SortID) ============ */
-function sortiert(){
-  return [...artikel].sort((a, b) =>
-    (a.sortid - b.sortid) ||
-    a.name.localeCompare(b.name, "de", { sensitivity: "base" }));
+/* ================= CONFIG LADEN ================= */
+async function ladeConfig(){
+  try{ feldConfig = await api("/config"); }catch(e){}
 }
-function ladeListe(){
+
+/* ================= LISTE & SUCHE ================= */
+async function ladeListe(){
+  try{ artikelListe = await api("/artikel"); }
+  catch(e){ if(e.message !== "Nicht angemeldet") toast(e.message); return; }
+  zeichneListe();
+}
+function zeichneListe(){
   const q = $("suchfeld").value.toLowerCase().trim();
-  let liste = sortiert();
+  let liste = artikelListe;
   if(q) liste = liste.filter(a =>
     [a.nummer, a.name, a.kiste, a.ref, a.notiz, a.aliase, String(a.id),
      ...Object.values(a.extra || {})]
@@ -426,7 +442,7 @@ function ladeListe(){
   }
   ziel.innerHTML = liste.map(a => `
     <button class="zeile ${a.soll > 0 && a.menge < a.soll ? "unter" : ""}" onclick="oeffneDetail(${a.id})">
-      ${a.foto ? `<img class="z-foto" src="${a.foto}" alt="">` : ""}
+      ${a.thumb ? `<img class="z-foto" src="${a.thumb}" alt="">` : ""}
       <div class="z-info">
         <div class="z-name">${esc(a.name)}</div>
         <div class="z-meta">${esc(a.nummer || "–")}${a.ref ? " · REF " + esc(a.ref) : ""}</div>
@@ -440,17 +456,20 @@ function ladeListe(){
 }
 let suchTimer;
 $("suchfeld").addEventListener("input", () => {
-  clearTimeout(suchTimer); suchTimer = setTimeout(ladeListe, 200);
+  clearTimeout(suchTimer); suchTimer = setTimeout(zeichneListe, 200);
 });
 
-/* ============ DETAIL ============ */
-function oeffneDetail(id){
-  aktuellerArtikel = artikel.find(a => a.id === Number(id));
-  if(!aktuellerArtikel) return toast("Artikel nicht gefunden");
+/* ================= DETAIL ================= */
+async function oeffneDetail(id){
+  aktuellerArtikel = artikelListe.find(a => a.id === Number(id));
+  if(!aktuellerArtikel){
+    try{ aktuellerArtikel = await api("/artikel/" + id); }
+    catch(e){ return toast("Artikel nicht gefunden"); }
+  }
   const a = aktuellerArtikel, L = feldConfig.labels;
   $("d-titel").textContent = a.name;
   $("d-inhalt").innerHTML = `
-    ${a.foto ? `<img class="d-foto" src="${a.foto}" alt="Foto: ${esc(a.name)}">` : ""}
+    ${a.foto ? `<img class="d-foto" id="d-foto" src="${a.thumb || ""}" alt="Foto: ${esc(a.name)}">` : ""}
     <div class="mengensteller">
       <button onclick="aendereMenge(-1)" aria-label="${esc(L.menge)} verringern">−</button>
       <div class="wert ${a.menge && !(a.soll > 0 && a.menge < a.soll) ? "" : "null"}" id="d-menge">${a.menge}</div>
@@ -465,43 +484,56 @@ function oeffneDetail(id){
         ? `<div class="feld"><dt>${esc(f.label)}</dt><dd>${esc(a.extra[f.key])}</dd></div>` : "").join("")}
       <div class="feld"><dt>${esc(L.sortid)}</dt><dd>${a.sortid}</dd></div>
       ${a.notiz ? `<div class="feld"><dt>${esc(L.notiz)}</dt><dd style="font-family:inherit">${esc(a.notiz)}</dd></div>` : ""}
+      <div class="feld"><dt>Geändert</dt><dd>${a.geaendert ? new Date(a.geaendert).toLocaleString("de-DE") : "–"}</dd></div>
       <div class="feld"><dt>${esc(L.aliase)}</dt><dd style="font-family:inherit">${esc(a.aliase || "–")}</dd></div>
     </dl>
     <div class="qrbox">
       <div id="d-qr"></div>
-      <span class="qr-hinweis">${esc(BASIS)}/#a=${a.id}</span>
+      <span class="qr-hinweis">${esc(BASIS)}#a=${a.id}</span>
     </div>
     <div class="aktionen">
       <button class="knopf" onclick="erstelleEtikettenPdf([${a.id}])">⬚ Etikett als PDF</button>
       <button class="knopf gefahr" onclick="loescheArtikel()">Artikel löschen</button>
     </div>`;
-  new QRCode($("d-qr"), { text: `${BASIS}/#a=${a.id}`, width: 170, height: 170, correctLevel: QRCode.CorrectLevel.M });
+  new QRCode($("d-qr"), { text: `${BASIS}#a=${a.id}`, width: 170, height: 170,
+    correctLevel: QRCode.CorrectLevel.M });
   $("detail").classList.add("offen");
+  if(a.foto){
+    api("/foto/" + a.id).then(d => {
+      const el = $("d-foto"); if(el) el.src = d.data;
+    }).catch(() => {});
+  }
 }
 
-function aendereMenge(delta){
+async function aendereMenge(delta){
   if(!aktuellerArtikel) return;
-  aktuellerArtikel.menge = Math.max(0, (aktuellerArtikel.menge || 0) + delta);
-  persistiere();
-  const w = $("d-menge"), ak = aktuellerArtikel;
-  w.textContent = ak.menge;
-  w.classList.toggle("null", !ak.menge || (ak.soll > 0 && ak.menge < ak.soll));
-  ladeListe();
+  try{
+    const neu = await api(`/artikel/${aktuellerArtikel.id}/menge`, {
+      method: "PATCH", body: JSON.stringify({ delta }),
+    });
+    aktuellerArtikel.menge = neu.menge;
+    aktuellerArtikel.geaendert = neu.geaendert;
+    const w = $("d-menge"), ak = aktuellerArtikel;
+    w.textContent = ak.menge;
+    w.classList.toggle("null", !ak.menge || (ak.soll > 0 && ak.menge < ak.soll));
+    zeichneListe();
+  }catch(e){ toast(e.message); }
 }
 
-function loescheArtikel(){
+async function loescheArtikel(){
   if(!aktuellerArtikel) return;
   if(!confirm(`„${aktuellerArtikel.name}" wirklich löschen?`)) return;
-  artikel = artikel.filter(a => a.id !== aktuellerArtikel.id);
-  persistiere();
-  toast("Artikel gelöscht");
-  schliesseAlles(); ladeListe();
+  try{
+    await api("/artikel/" + aktuellerArtikel.id, { method: "DELETE" });
+    toast("Artikel gelöscht");
+    schliesseAlles(); ladeListe();
+  }catch(e){ toast(e.message); }
 }
 
-/* ============ FORMULAR (dynamisch aus Config) ============ */
+/* ================= FORMULAR ================= */
 function oeffneFormular(a){
   const L = feldConfig.labels;
-  formFotoDataUrl = null; formFotoLoeschen = false;
+  formFotoDataUrl = null; formThumb = null; formFotoLoeschen = false;
   $("f-titel").textContent = a ? "Artikel bearbeiten" : "Neuer Artikel";
   $("formular").dataset.id = a?.id || "";
   $("f-felder").innerHTML = `
@@ -528,7 +560,7 @@ function oeffneFormular(a){
     <input id="f-aliase" value="${esc(a?.aliase || "")}" placeholder="z. B. Mullbinde, Binde, Wickel">
     <label class="fl">Foto (optional)</label>
     <div class="foto-wahl">
-      <img class="foto-vorschau" id="f-vorschau" src="${a?.foto || ""}"
+      <img class="foto-vorschau" id="f-vorschau" src="${a?.thumb || ""}"
         style="${a?.foto ? "" : "visibility:hidden"}" alt="">
       <button class="knopf neben" type="button"
         onclick="document.getElementById('f-foto').click()">📷 Foto wählen</button>
@@ -541,19 +573,21 @@ function oeffneFormular(a){
     if(!datei) return;
     const leser = new FileReader();
     leser.onload = () => {
-      // Komprimieren, damit der Gerätespeicher lange reicht
       const bild = new Image();
       bild.onload = () => {
-        const MAX = 900;
-        const f = Math.min(1, MAX / Math.max(bild.width, bild.height));
-        const c = document.createElement("canvas");
-        c.width = Math.round(bild.width * f);
-        c.height = Math.round(bild.height * f);
-        c.getContext("2d").drawImage(bild, 0, 0, c.width, c.height);
-        formFotoDataUrl = c.toDataURL("image/jpeg", 0.82);
+        const skaliere = (max, qual) => {
+          const f = Math.min(1, max / Math.max(bild.width, bild.height));
+          const c = document.createElement("canvas");
+          c.width = Math.round(bild.width * f);
+          c.height = Math.round(bild.height * f);
+          c.getContext("2d").drawImage(bild, 0, 0, c.width, c.height);
+          return c.toDataURL("image/jpeg", qual);
+        };
+        formFotoDataUrl = skaliere(900, 0.82);
+        formThumb = skaliere(96, 0.7);
         formFotoLoeschen = false;
         const v = $("f-vorschau");
-        v.src = formFotoDataUrl; v.style.visibility = "visible";
+        v.src = formThumb; v.style.visibility = "visible";
         $("f-foto-weg").style.display = "";
       };
       bild.src = leser.result;
@@ -564,7 +598,7 @@ function oeffneFormular(a){
   if(!a) setTimeout(() => $("f-name").focus(), 50);
 }
 function fotoEntfernen(){
-  formFotoDataUrl = null; formFotoLoeschen = true;
+  formFotoDataUrl = null; formThumb = null; formFotoLoeschen = true;
   $("f-vorschau").style.visibility = "hidden";
   $("f-foto-weg").style.display = "none";
   $("f-foto").value = "";
@@ -572,40 +606,35 @@ function fotoEntfernen(){
 function bearbeiteAktuellen(){ if(aktuellerArtikel) oeffneFormular(aktuellerArtikel); }
 function schliesseFormular(){ $("formular").classList.remove("offen"); }
 
-function speichereArtikel(){
-  const id = Number($("formular").dataset.id);
+async function speichereArtikel(){
+  const id = $("formular").dataset.id;
   const extra = {};
   for(const f of feldConfig.felder){
     const w = ($("fx-" + f.key)?.value ?? "").trim();
     if(w) extra[f.key] = w;
   }
   const daten = {
-    name: $("f-name").value.trim(), nummer: $("f-nummer").value.trim(),
-    kiste: $("f-kiste").value.trim(),
-    menge: Math.max(0, parseInt($("f-menge").value, 10) || 0),
-    ref: $("f-ref").value.trim(), notiz: $("f-notiz").value.trim(),
-    soll: Math.max(0, parseInt($("f-soll").value, 10) || 0),
-    aliase: $("f-aliase").value.split(",").map(s => s.trim()).filter(Boolean).join(", "),
-    sortid: Number.isFinite(parseInt($("f-sortid").value, 10))
-      ? parseInt($("f-sortid").value, 10) : 100,
-    extra,
+    name: $("f-name").value, nummer: $("f-nummer").value,
+    kiste: $("f-kiste").value, menge: $("f-menge").value,
+    soll: $("f-soll").value, ref: $("f-ref").value,
+    notiz: $("f-notiz").value, aliase: $("f-aliase").value,
+    sortid: $("f-sortid").value, extra,
+    fotoData: formFotoDataUrl !== null ? formFotoDataUrl : (formFotoLoeschen ? "" : null),
+    thumb: formThumb !== null ? formThumb : (formFotoLoeschen ? "" : undefined),
   };
-  if(!daten.name) return toast(feldConfig.labels.name + " fehlt");
-  let zielId = id;
-  if(id){
-    const i = artikel.findIndex(a => a.id === id);
-    const foto = formFotoDataUrl ?? (formFotoLoeschen ? "" : artikel[i].foto);
-    artikel[i] = { id, ...daten, foto };
-  } else {
-    zielId = naechsteId++;
-    artikel.push({ id: zielId, ...daten, foto: formFotoDataUrl || "" });
-  }
-  persistiere();
-  schliesseFormular(); toast("Gespeichert"); ladeListe();
-  oeffneDetail(zielId);
+  if(!daten.name.trim()) return toast(feldConfig.labels.name + " fehlt");
+  try{
+    toast("Speichern …");
+    const a = await api("/artikel" + (id ? "/" + id : ""), {
+      method: id ? "PUT" : "POST", body: JSON.stringify(daten),
+    });
+    schliesseFormular(); toast("Gespeichert");
+    await ladeListe();
+    oeffneDetail(a.id);
+  }catch(e){ toast(e.message); }
 }
 
-/* ============ CONFIG ============ */
+/* ================= CONFIG-SEITE ================= */
 function oeffneConfig(){
   const L = feldConfig.labels;
   const standard = { name:"Artikelname", nummer:"Artikelnummer", kiste:"Kiste",
@@ -630,32 +659,29 @@ function zeichneCfgFelder(){
 function cfgFeldHinzu(){
   const label = $("cfg-neu").value.trim();
   if(!label) return toast("Feldname eingeben");
-  cfgFelderTmp.push({ key: "f" + Math.random().toString(36).slice(2, 10), label });
+  cfgFelderTmp.push({ key: "", label });
   $("cfg-neu").value = "";
   zeichneCfgFelder();
 }
 function cfgFeldWeg(i){
-  if(!confirm(`Feld „${cfgFelderTmp[i].label}" wirklich entfernen?`)) return;
+  if(cfgFelderTmp[i].key && !confirm(`Feld „${cfgFelderTmp[i].label}" wirklich entfernen?`)) return;
   cfgFelderTmp.splice(i, 1);
   zeichneCfgFelder();
 }
-function speichereConfig(){
+async function speichereConfig(){
   const labels = {};
-  const standard = { name:"Artikelname", nummer:"Artikelnummer", kiste:"Kiste",
-    menge:"Menge", soll:"Sollwert", ref:"REF-Nr", notiz:"Notiz",
-    sortid:"SortID", aliase:"Andere Namen" };
-  for(const k of Object.keys(standard))
-    labels[k] = $("cfg-l-" + k).value.trim() || standard[k];
-  feldConfig = {
-    labels,
-    felder: cfgFelderTmp.filter(f => f.label.trim()),
-  };
-  cfgFelderTmp = null;
-  persistiere();
-  schliesseAlles(); toast("Config gespeichert"); ladeListe();
+  for(const k of ["name","nummer","kiste","menge","soll","ref","notiz","sortid","aliase"])
+    labels[k] = $("cfg-l-" + k).value;
+  try{
+    feldConfig = await api("/config", {
+      method: "PUT", body: JSON.stringify({ labels, felder: cfgFelderTmp }),
+    });
+    cfgFelderTmp = null;
+    schliesseAlles(); toast("Config gespeichert"); zeichneListe();
+  }catch(e){ toast(e.message); }
 }
 
-/* ============ SCANNER ============ */
+/* ================= SCANNER ================= */
 function oeffneScanner(){
   $("scanner").classList.add("offen");
   try{
@@ -666,11 +692,11 @@ function oeffneScanner(){
       (text) => {
         const m = text.match(/#a=(\d+)/) || text.match(/^(\d+)$/);
         if(m){ schliesseScanner(); oeffneDetail(m[1]); }
-        else toast("Kein Materialkeller-Code");
+        else toast("Kein Keller-01-Code");
       },
       () => {}
-    ).catch(() => toast("Kamera hier nicht verfügbar – läuft auf dem Server (HTTPS)"));
-  }catch(e){ toast("Kamera hier nicht verfügbar – läuft auf dem Server (HTTPS)"); }
+    ).catch(() => toast("Kamera nicht verfügbar – Berechtigung prüfen"));
+  }catch(e){ toast("Kamera nicht verfügbar"); }
 }
 function schliesseScanner(){
   $("scanner").classList.remove("offen");
@@ -680,9 +706,9 @@ function schliesseScanner(){
   }
 }
 
-/* ============ ETIKETTEN (PDF clientseitig) ============ */
+/* ================= ETIKETTEN ================= */
 function oeffneEtiketten(){
-  $("e-liste").innerHTML = artikel.length ? sortiert().map(a => `
+  $("e-liste").innerHTML = artikelListe.length ? artikelListe.map(a => `
     <label class="wahl">
       <input type="checkbox" value="${a.id}">
       <div class="z-info">
@@ -715,7 +741,7 @@ function qrAlsDataUrl(text){
 async function erstelleEtikettenPdf(idsDirekt){
   let ids = idsDirekt || [...document.querySelectorAll("#e-liste input:checked")].map(b => Number(b.value));
   if(!ids.length) return toast("Mindestens einen Artikel auswählen");
-  const liste = ids.map(id => artikel.find(a => a.id === id)).filter(Boolean);
+  const liste = ids.map(id => artikelListe.find(a => a.id === id)).filter(Boolean);
   toast("PDF wird erstellt …");
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({ unit: "pt", format: "a4" });
@@ -731,7 +757,7 @@ async function erstelleEtikettenPdf(idsDirekt){
     doc.setDrawColor(150); doc.setLineWidth(0.5);
     doc.rect(x + 2, y + 2, W - 4, H - 4);
     const qrSize = H - 16;
-    const png = await qrAlsDataUrl(`${BASIS}/#a=${a.id}`);
+    const png = await qrAlsDataUrl(`${BASIS}#a=${a.id}`);
     if(png) doc.addImage(png, "PNG", x + 8, y + 8, qrSize, qrSize);
     const tx = x + 8 + qrSize + 8, tw = W - qrSize - 28;
     doc.setTextColor(0);
@@ -746,10 +772,10 @@ async function erstelleEtikettenPdf(idsDirekt){
   doc.save("etiketten.pdf");
 }
 
-/* ============ BESTANDSLISTE ALS PDF ============ */
+/* ================= BESTANDSLISTE ALS PDF ================= */
 function erstelleBestandsPdf(nurUnter){
   const L = feldConfig.labels;
-  let liste = sortiert();
+  let liste = artikelListe;
   if(nurUnter) liste = liste.filter(a => a.soll > 0 && a.menge < a.soll);
   toast("PDF wird erstellt …");
   const { jsPDF } = window.jspdf;
@@ -763,6 +789,7 @@ function erstelleBestandsPdf(nurUnter){
     { label: L.ref,    b: 105, wert: a => a.ref || "-" },
   ];
   const X0 = 40, ZH = 20, BREITE = spalten.reduce((s, c) => s + c.b, 0);
+  const y0Text = (y) => y + 13;
   const kopf = () => {
     doc.setFont("helvetica", "bold"); doc.setFontSize(14); doc.setTextColor(44, 52, 44);
     doc.text(nurUnter
@@ -777,7 +804,6 @@ function erstelleBestandsPdf(nurUnter){
     for(const s of spalten){ doc.text(s.label.slice(0, 18), x + 4, y0Text(74)); x += s.b; }
     return 74 + ZH;
   };
-  const y0Text = (y) => y + 13;
   let y = kopf();
   for(const a of liste){
     if(y + ZH > 800){ doc.addPage(); y = kopf(); }
@@ -803,98 +829,113 @@ function erstelleBestandsPdf(nurUnter){
   doc.save(nurUnter ? "unterbestand.pdf" : "bestand.pdf");
 }
 
-/* ============ CSV-EXPORT ============ */
+/* ================= CSV-EXPORT ================= */
 function exportiereCsv(){
   zeigeMenue(false);
   const L = feldConfig.labels;
   const kopf = ["ID", L.sortid, L.nummer, L.name, L.kiste, L.menge, L.soll, L.ref,
     ...feldConfig.felder.map(f => f.label), L.notiz, L.aliase];
-  const zeilen = sortiert().map(a =>
+  const zeilen = artikelListe.map(a =>
     [a.id, a.sortid, a.nummer, a.name, a.kiste, a.menge, a.soll || 0, a.ref,
      ...feldConfig.felder.map(f => a.extra?.[f.key] ?? ""), a.notiz, a.aliase || ""]
       .map(v => `"${String(v ?? "").replace(/"/g,'""')}"`).join(";"));
-  const blob = new Blob(["\uFEFF" + kopf.join(";") + "\n" + zeilen.join("\n")], { type:"text/csv;charset=utf-8" });
+  const blob = new Blob(["\uFEFF" + kopf.join(";") + "\n" + zeilen.join("\n")],
+    { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = "Materialkeller_Demo.csv"; a.click();
+  a.href = url; a.download = "Keller01_Bestand.csv"; a.click();
   URL.revokeObjectURL(url);
-  toast("CSV heruntergeladen (Server-Version: echtes .xlsx)");
 }
 
-/* ============ BACKUP ============ */
-function exportiereBackup(){
+/* ================= BACKUP ================= */
+async function exportiereBackup(){
   zeigeMenue(false);
-  const blob = new Blob([JSON.stringify(
-    { version: 3, naechsteId, artikel, feldConfig }, null, 1)],
-    { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "Keller01_Backup_" + new Date().toISOString().slice(0, 10) + ".json";
-  a.click();
-  URL.revokeObjectURL(url);
-  toast("Backup gespeichert – Datei sicher ablegen!");
+  toast("Backup wird erstellt …");
+  try{
+    const liste = await api("/artikel");
+    for(const a of liste){
+      if(a.foto){
+        try{ a.foto = (await api("/foto/" + a.id)).data; }
+        catch(e){ a.foto = ""; }
+      } else a.foto = "";
+    }
+    const blob = new Blob([JSON.stringify(
+      { version: 3, artikel: liste, feldConfig }, null, 1)],
+      { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "Keller01_Backup_" + new Date().toISOString().slice(0, 10) + ".json";
+    a.click();
+    URL.revokeObjectURL(url);
+    toast("Backup gespeichert");
+  }catch(e){ toast(e.message); }
 }
-function importiereBackup(datei){
+async function importiereBackup(datei){
   if(!datei) return;
   zeigeMenue(false);
   const leser = new FileReader();
-  leser.onload = () => {
+  leser.onload = async () => {
     try{
       const d = JSON.parse(leser.result);
       if(!Array.isArray(d.artikel)) throw new Error("Keine gültige Backup-Datei");
-      if(!confirm(`Backup mit ${d.artikel.length} Artikeln einspielen?\nErsetzt den aktuellen Bestand auf diesem Gerät.`)) return;
-      artikel = d.artikel;
-      naechsteId = d.naechsteId || (Math.max(0, ...artikel.map(a => a.id)) + 1);
-      if(d.feldConfig?.labels) feldConfig = d.feldConfig;
-      persistiere();
-      ladeListe();
-      toast(`${artikel.length} Artikel wiederhergestellt`);
+      if(!confirm(`${d.artikel.length} Artikel aus dem Backup zum Bestand HINZUFÜGEN?`)) return;
+      if(d.feldConfig?.labels){
+        try{
+          feldConfig = await api("/config", {
+            method: "PUT", body: JSON.stringify(d.feldConfig),
+          });
+        }catch(e){}
+      }
+      toast("Import läuft …");
+      let n = 0;
+      for(const roh of d.artikel){
+        const foto = typeof roh.foto === "string" && roh.foto.startsWith("data:image/")
+          ? roh.foto : null;
+        await api("/artikel", { method: "POST", body: JSON.stringify({
+          ...roh, fotoData: foto, thumb: roh.thumb || undefined,
+        })});
+        n++;
+      }
+      await ladeListe();
+      toast(`${n} Artikel importiert`);
     }catch(e){ toast("Fehler: " + e.message); }
   };
   leser.readAsText(datei);
   $("backupDatei").value = "";
 }
 
-/* ============ NAVIGATION ============ */
+/* ================= NAVIGATION & START ================= */
 function zeigeMenue(an){ $("menue").classList.toggle("offen", an); }
 function schliesseAlles(){
   ["detail","etiketten","config"].forEach(id => $(id).classList.remove("offen"));
   cfgFelderTmp = null;
 }
 
-/* ============ START ============ */
 (async function starte(){
-  idb = await oeffneDb();
   const band = $("speicher-band");
-  if(!idb){
-    nurSpeicher = true;
-    band.textContent = "VORSCHAU – Speicherung hier nicht möglich";
+  if(WORKER_URL.includes("HIER-WORKER")){
+    band.textContent = "EINRICHTUNG NÖTIG: Worker-Adresse in index.html eintragen";
     band.style.display = "inline-block";
-  } else {
-    const daten = await kvGet("daten");
-    if(daten){
-      naechsteId = daten.naechsteId || 1;
-      artikel = daten.artikel || [];
-      if(daten.feldConfig?.labels) feldConfig = daten.feldConfig;
-      nutzer = daten.nutzer || [];
-    }
+    return;
   }
-  if(!nutzer.length){
-    loginTab("reg");
-    $("l-hinweis").textContent = "Erstes Konto anlegen – wird nur auf diesem Gerät gespeichert.";
-  } else {
-    const sitzung = idb ? await kvGet("sitzung") : "";
-    if(sitzung && nutzer.some(u => u.benutzername === sitzung)){
-      angemeldet = sitzung;
-      $("menue-nutzer").textContent = "Angemeldet als " + sitzung;
-      $("login").classList.remove("offen");
-    }
+  idb = await oeffneDb();
+  token = (idb ? await kvGet("token") : "") || "";
+  if(token){
+    try{
+      const me = await api("/me");
+      $("menue-nutzer").textContent = "Angemeldet als " + me.benutzername;
+      zeigeLogin(false);
+      await ladeConfig();
+      await ladeListe();
+      return;
+    }catch(e){ token = ""; }
   }
-  ladeListe();
+  zeigeLogin(true);
 })();
 if("serviceWorker" in navigator && location.protocol === "https:")
   navigator.serviceWorker.register("sw.js").catch(() => {});
+
 </script>
 </body>
 </html>
