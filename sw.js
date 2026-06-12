@@ -1,5 +1,5 @@
 // Service Worker: nur App-Dateien cachen, Worker-API immer live
-const CACHE = "keller01-online-v1";
+const CACHE = "keller01-online-v2";
 const DATEIEN = ["./", "./index.html", "./manifest.json",
   "./icon-192.png", "./icon-512.png", "./icon-180.png"];
 

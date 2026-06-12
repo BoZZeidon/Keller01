@@ -46,11 +46,23 @@ async function kvJson(env, schluessel, standard) {
   return wert ? JSON.parse(wert) : standard;
 }
 
-const datenLaden = (env) => kvJson(env, "daten", { naechsteId: 1, artikel: [] });
+const datenLaden = async (env) => {
+  const d = await kvJson(env, "daten", { naechsteId: 1, artikel: [], papierkorb: [] });
+  if (!Array.isArray(d.papierkorb)) d.papierkorb = [];
+  // Papierkorb: älter als 30 Tage endgültig löschen
+  const limit = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const alt = d.papierkorb.filter((a) => new Date(a.geloescht).getTime() < limit);
+  if (alt.length) {
+    d.papierkorb = d.papierkorb.filter((a) => new Date(a.geloescht).getTime() >= limit);
+    for (const a of alt) await env.KELLER.delete("foto:" + a.id).catch?.(() => {});
+    await datenSpeichern(env, d);
+  }
+  return d;
+};
 const datenSpeichern = (env, d) => env.KELLER.put("daten", JSON.stringify(d));
 const nutzerLaden = (env) => kvJson(env, "nutzer", []);
 const configLaden = (env) =>
-  kvJson(env, "config", { labels: { ...DEFAULT_LABELS }, felder: [] });
+  kvJson(env, "config", { labels: { ...DEFAULT_LABELS }, felder: [], kistenFarben: {} });
 
 function clean(b, felder) {
   const ganz = (w, std) => Number.isFinite(parseInt(w, 10)) ? parseInt(w, 10) : std;
@@ -74,6 +86,12 @@ function clean(b, felder) {
     extra,
     geaendert: new Date().toISOString(),
   };
+}
+
+async function protokolliere(env, id, nutzer, delta, mengeNeu) {
+  const log = await kvJson(env, "log:" + id, []);
+  log.push({ zeit: new Date().toISOString(), nutzer, delta, menge: mengeNeu });
+  await env.KELLER.put("log:" + id, JSON.stringify(log.slice(-50)));
 }
 
 async function angemeldeterNutzer(req, env) {
@@ -156,7 +174,13 @@ export default {
     if (pfad === "/config" && req.method === "PUT") {
       const b = await koerper();
       const alt = await configLaden(env);
-      const neu = { labels: { ...alt.labels }, felder: [] };
+      const neu = { labels: { ...alt.labels }, felder: [], kistenFarben: {} };
+      if (b.kistenFarben && typeof b.kistenFarben === "object") {
+        for (const [kiste, farbe] of Object.entries(b.kistenFarben).slice(0, 100)) {
+          if (/^#[0-9a-fA-F]{6}$/.test(String(farbe)))
+            neu.kistenFarben[String(kiste).slice(0, 30)] = String(farbe);
+        }
+      }
       for (const k of Object.keys(DEFAULT_LABELS)) {
         const w = String(b.labels?.[k] ?? "").trim();
         neu.labels[k] = w || DEFAULT_LABELS[k];
@@ -186,6 +210,7 @@ export default {
       if (!a.name) return fehler("Artikelname fehlt");
       const d = await datenLaden(env);
       a.id = d.naechsteId++;
+      a.entnommen = 0;
       a.foto = (await fotoSpeichern(env, a.id, b.fotoData ?? null)) || "";
       d.artikel.push(a);
       await datenSpeichern(env, d);
@@ -211,6 +236,12 @@ export default {
       const alt = d.artikel[i];
       const a = clean(b, cfg.felder);
       a.id = alt.id;
+      a.entnommen = alt.entnommen || 0;
+      if (a.menge !== alt.menge) {
+        const diff = a.menge - alt.menge;
+        if (diff < 0) a.entnommen += -diff;
+        await protokolliere(env, a.id, ich.benutzername, diff, a.menge);
+      }
       const fotoNeu = await fotoSpeichern(env, a.id, b.fotoData ?? null);
       a.foto = fotoNeu === null ? alt.foto : fotoNeu;
       if (fotoNeu === null) a.thumb = a.thumb || alt.thumb;
@@ -225,19 +256,62 @@ export default {
       const d = await datenLaden(env);
       const a = d.artikel.find((x) => x.id === Number(mMenge[1]));
       if (!a) return fehler("Artikel nicht gefunden", 404);
-      a.menge = Math.max(0, (a.menge || 0) + (parseInt(b.delta, 10) || 0));
+      const delta = parseInt(b.delta, 10) || 0;
+      const vorher = a.menge || 0;
+      a.menge = Math.max(0, vorher + delta);
+      const effektiv = a.menge - vorher;
+      if (effektiv < 0) a.entnommen = (a.entnommen || 0) + -effektiv;
       a.geaendert = new Date().toISOString();
       await datenSpeichern(env, d);
+      if (effektiv !== 0)
+        await protokolliere(env, a.id, ich.benutzername, effektiv, a.menge);
       return antwort(a);
     }
 
     if (mArtikel && req.method === "DELETE") {
       const d = await datenLaden(env);
-      d.artikel = d.artikel.filter((x) => x.id !== Number(mArtikel[1]));
-      await env.KELLER.delete("foto:" + mArtikel[1]);
+      const a = d.artikel.find((x) => x.id === Number(mArtikel[1]));
+      if (a) {
+        d.artikel = d.artikel.filter((x) => x.id !== a.id);
+        a.geloescht = new Date().toISOString();
+        a.geloeschtVon = ich.benutzername;
+        d.papierkorb.push(a);
+        await datenSpeichern(env, d);
+      }
+      return antwort({ ok: true });
+    }
+
+    // ===== PAPIERKORB =====
+    if (pfad === "/papierkorb" && req.method === "GET") {
+      const d = await datenLaden(env);
+      d.papierkorb.sort((a, b) => b.geloescht.localeCompare(a.geloescht));
+      return antwort(d.papierkorb);
+    }
+    const mWieder = pfad.match(/^\/papierkorb\/(\d+)\/wiederherstellen$/);
+    if (mWieder && req.method === "POST") {
+      const d = await datenLaden(env);
+      const i = d.papierkorb.findIndex((x) => x.id === Number(mWieder[1]));
+      if (i < 0) return fehler("Nicht im Papierkorb", 404);
+      const a = d.papierkorb.splice(i, 1)[0];
+      delete a.geloescht; delete a.geloeschtVon;
+      a.geaendert = new Date().toISOString();
+      d.artikel.push(a);
+      await datenSpeichern(env, d);
+      return antwort(a);
+    }
+    const mEndg = pfad.match(/^\/papierkorb\/(\d+)$/);
+    if (mEndg && req.method === "DELETE") {
+      const d = await datenLaden(env);
+      d.papierkorb = d.papierkorb.filter((x) => x.id !== Number(mEndg[1]));
+      await env.KELLER.delete("foto:" + mEndg[1]);
       await datenSpeichern(env, d);
       return antwort({ ok: true });
     }
+
+    // ===== PROTOKOLL =====
+    const mLog = pfad.match(/^\/log\/(\d+)$/);
+    if (mLog && req.method === "GET")
+      return antwort(await kvJson(env, "log:" + mLog[1], []));
 
     // ===== FOTO (Vollbild) =====
     if (mFoto && req.method === "GET") {
